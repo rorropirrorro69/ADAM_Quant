@@ -1,235 +1,267 @@
 import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import plotly.graph_objects as go
-import json
-import os
 import calendar
 from datetime import datetime, date
 
-# --- CONFIGURACIÓN DE UI ---
+# --- 1. CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(page_title="ADAM Quant - Alpha Terminal", layout="wide", page_icon="🛡️")
 
+# Estilos CSS para apariencia profesional
 st.markdown("""
     <style>
     .metric-container {
-        background-color: rgba(255, 255, 255, 0.05);
+        background-color: #1E1E1E;
         border-radius: 10px;
         padding: 15px;
-        border: 1px solid rgba(255, 255, 255, 0.1);
+        border: 1px solid #333;
     }
     .stProgress > div > div > div > div {
         background-color: #00FF88;
     }
+    div[data-testid="stMetricValue"] {
+        font-size: 24px;
+        color: #00FF88;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-USER_DB = 'users.json'
-DB_FOLDER = 'user_data/'
-if not os.path.exists(DB_FOLDER): os.makedirs(DB_FOLDER)
+# --- 2. CONEXIÓN A GOOGLE SHEETS ---
+try:
+    conn = st.connection("gsheets", type=GSheetsConnection)
+except Exception as e:
+    st.error(f"Error de conexión: {e}")
+    st.stop()
 
-# --- CONSTANTES DE CUENTA ---
+# --- 3. CONSTANTES DEL PROYECTO ---
 STARTING_BALANCE = 50000.0
 MAX_DRAWDOWN_LIMIT = 2500.0
+GOAL_BALANCE = 54100.0  # Meta para el payout
 LIQUIDATION_THRESHOLD = STARTING_BALANCE - MAX_DRAWDOWN_LIMIT
 
-# --- LÓGICA DE DATOS Y USUARIOS ---
-def load_users():
-    if os.path.exists(USER_DB):
-        with open(USER_DB, 'r') as f: return json.load(f)
-    return {"admin": "admin123"}
+# --- 4. FUNCIONES DE GESTIÓN DE DATOS ---
+def get_all_users():
+    """Carga la lista de usuarios desde la hoja 'users'."""
+    try:
+        df = conn.read(worksheet="users", ttl=0)
+        return df if not df.empty else pd.DataFrame(columns=["username", "password"])
+    except:
+        return pd.DataFrame(columns=["username", "password"])
 
-def save_users(users):
-    with open(USER_DB, 'w') as f: json.dump(users, f)
+def get_user_trades(username):
+    """Carga los trades de un usuario específico desde la hoja 'trades'."""
+    try:
+        df = conn.read(worksheet="trades", ttl=0)
+        if not df.empty and "username" in df.columns:
+            # Filtrar por usuario y asegurar formato de fecha
+            df_user = df[df["username"] == username].copy()
+            df_user['Date'] = pd.to_datetime(df_user['Date'])
+            return df_user
+        # Estructura vacía si no hay datos
+        return pd.DataFrame(columns=['Date', 'Symbol', 'P&L', 'Setup', 'Side', 'R_Multiple', 'Mistakes', 'username'])
+    except:
+        return pd.DataFrame(columns=['Date', 'Symbol', 'P&L', 'Setup', 'Side', 'R_Multiple', 'Mistakes', 'username'])
 
-def get_user_file(username): return f"{DB_FOLDER}{username}_journal.csv"
-
-# --- APP PRINCIPAL ---
-if "logged_in" not in st.session_state: st.session_state.logged_in = False
+# --- 5. LÓGICA DE AUTENTICACIÓN ---
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
 
 if not st.session_state.logged_in:
-    st.title("🛡️ ADAM Quant - Alpha Terminal")
+    st.title("🛡️ ADAM Quant | Alpha Login")
+    
     tab1, tab2 = st.tabs(["Iniciar Sesión", "Crear Cuenta"])
+    
     with tab1:
-        u = st.text_input("Usuario")
-        p = st.text_input("Contraseña", type="password")
-        if st.button("Ingresar"):
-            users = load_users()
-            if u in users and users[u] == p:
-                st.session_state.logged_in = True
-                st.session_state.username = u
-                st.rerun()
+        with st.form("login_form"):
+            u = st.text_input("Usuario")
+            p = st.text_input("Contraseña", type="password")
+            submitted = st.form_submit_button("Ingresar")
+            
+            if submitted:
+                users_df = get_all_users()
+                if not users_df.empty and u in users_df["username"].values:
+                    stored_pass = users_df[users_df["username"] == u]["password"].values[0]
+                    # Convertimos a string para asegurar comparación
+                    if str(stored_pass) == str(p):
+                        st.session_state.logged_in = True
+                        st.session_state.username = u
+                        st.rerun()
+                    else:
+                        st.error("Contraseña incorrecta.")
+                else:
+                    st.error("Usuario no encontrado.")
+
     with tab2:
-        new_u = st.text_input("Nuevo Usuario")
-        new_p = st.text_input("Nueva Contraseña", type="password")
-        if st.button("Registrar"):
-            users = load_users()
-            users[new_u] = new_p
-            save_users(users)
-            st.success("Cuenta creada.")
+        with st.form("register_form"):
+            new_u = st.text_input("Nuevo Usuario")
+            new_p = st.text_input("Nueva Contraseña", type="password")
+            reg_submitted = st.form_submit_button("Registrar")
+            
+            if reg_submitted:
+                if new_u and new_p:
+                    users_df = get_all_users()
+                    if not users_df.empty and new_u in users_df["username"].values:
+                        st.warning("El usuario ya existe.")
+                    else:
+                        new_user_row = pd.DataFrame([{"username": new_u, "password": new_p}])
+                        # Concatenar y guardar
+                        updated_users = pd.concat([users_df, new_user_row], ignore_index=True)
+                        conn.update(worksheet="users", data=updated_users)
+                        st.success("¡Cuenta creada! Ve a la pestaña de Iniciar Sesión.")
+                else:
+                    st.warning("Por favor llena todos los campos.")
+
+# --- 6. APLICACIÓN PRINCIPAL (DASHBOARD) ---
 else:
     username = st.session_state.username
-    user_file = get_user_file(username)
-
-    def load_user_data():
-        if os.path.exists(user_file):
-            df = pd.read_csv(user_file)
-            df['Date'] = pd.to_datetime(df['Date'], format='mixed', errors='coerce')
-            return df.dropna(subset=['Date'])
-        return pd.DataFrame(columns=['Date', 'Symbol', 'P&L', 'Setup', 'Side', 'R_Multiple', 'Mistakes'])
-
+    
     # Sidebar
-    st.sidebar.title(f"👤 {username}")
-    nav = st.sidebar.radio("Navegación", ["Dashboard", "Registrar Trade", "Cerrar Sesión"])
+    st.sidebar.title(f"👤 Trader: {username}")
+    st.sidebar.markdown("---")
+    nav = st.sidebar.radio("Menú", ["Dashboard Pro", "Registrar Trade", "Cerrar Sesión"])
 
     if nav == "Cerrar Sesión":
         st.session_state.logged_in = False
         st.rerun()
 
+    # --- VISTA: REGISTRAR TRADE ---
     if nav == "Registrar Trade":
-        st.subheader("📝 Nuevo Registro")
-        df = load_user_data()
+        st.subheader("📝 Bitácora de Operaciones")
+        st.info("Registra tus operaciones para alimentar el algoritmo de análisis.")
+        
         with st.form("trade_form"):
             col1, col2 = st.columns(2)
             with col1:
                 d = st.date_input("Fecha", date.today())
-                sym = st.selectbox("Símbolo", ["NQ", "ES", "MNQ", "MES", "BTC", "GOLD"])
-                side = st.selectbox("Lado", ["Long", "Short"])
+                sym = st.selectbox("Instrumento", ["NQ", "ES", "MNQ", "MES", "BTC", "GOLD", "CL"])
+                side = st.selectbox("Dirección", ["Long", "Short"])
             with col2:
-                pnl = st.number_input("P&L ($)", step=50.0)
+                pnl = st.number_input("P&L ($)", step=50.0, format="%.2f")
                 rm = st.number_input("R-Multiple", step=0.1, value=1.0)
-                setup = st.text_input("Setup", value="Manual")
+                setup = st.text_input("Setup / Estrategia", value="Manual")
             
-            if st.form_submit_button("Guardar Trade"):
-                new_row = pd.DataFrame([[pd.to_datetime(d), sym, pnl, setup, side, rm, "None"]], columns=df.columns)
-                df = pd.concat([df, new_row], ignore_index=True)
-                df.to_csv(user_file, index=False)
-                st.success("Trade registrado exitosamente.")
+            notes = st.text_area("Notas / Errores", "Ninguno")
+            
+            if st.form_submit_button("💾 Guardar Trade en Nube"):
+                try:
+                    # Cargar trades existentes
+                    all_trades = conn.read(worksheet="trades", ttl=0)
+                    
+                    # Crear nuevo registro
+                    new_trade = pd.DataFrame([{
+                        "Date": d.strftime('%Y-%m-%d'),
+                        "Symbol": sym,
+                        "P&L": float(pnl),
+                        "Setup": setup,
+                        "Side": side,
+                        "R_Multiple": float(rm),
+                        "Mistakes": notes,
+                        "username": username
+                    }])
+                    
+                    # Guardar
+                    updated_trades = pd.concat([all_trades, new_trade], ignore_index=True)
+                    conn.update(worksheet="trades", data=updated_trades)
+                    st.success("✅ Trade sincronizado exitosamente con Google Sheets.")
+                    st.balloons()
+                except Exception as e:
+                    st.error(f"Error guardando: {e}")
 
-    if nav == "Dashboard":
-        st.title(f"🛡️ Terminal Pro: {username}")
-        df = load_user_data()
+    # --- VISTA: DASHBOARD ---
+    if nav == "Dashboard Pro":
+        st.title(f"🛡️ Terminal Alpha: {username}")
+        df = get_user_trades(username)
         
         if not df.empty:
-            # --- CÁLCULOS DE MÉTRICAS ---
+            # Procesamiento de Datos
             df = df.sort_values('Date')
             net_pnl = df['P&L'].sum()
             current_balance = STARTING_BALANCE + net_pnl
             
-            # Cálculo de Drawdown Actual (desde el pico de equidad)
+            # Cálculos de Drawdown
             df['Cumulative_PnL'] = df['P&L'].cumsum()
             df['Equity'] = STARTING_BALANCE + df['Cumulative_PnL']
             peak = df['Equity'].cummax()
             current_dd = peak.iloc[-1] - current_balance
-            dd_pct_of_limit = min(1.0, current_dd / MAX_DRAWDOWN_LIMIT)
+            dd_pct_of_limit = min(1.0, current_dd / MAX_DRAWDOWN_LIMIT) if MAX_DRAWDOWN_LIMIT > 0 else 0
 
-            trade_win = (len(df[df['P&L'] > 0]) / len(df)) * 100
+            # KPIs Avanzados
+            wins = df[df['P&L'] > 0]
+            losses = df[df['P&L'] < 0]
+            win_rate = (len(wins) / len(df)) * 100
             
-            # Profit Factor
-            gains = df[df['P&L'] > 0]['P&L'].sum()
-            losses = abs(df[df['P&L'] < 0]['P&L'].sum())
-            pf = gains / losses if losses > 0 else 1.0
+            avg_win = wins['P&L'].mean() if not wins.empty else 0
+            avg_loss = abs(losses['P&L'].mean()) if not losses.empty else 0
+            profit_factor = (wins['P&L'].sum() / abs(losses['P&L'].sum())) if not losses.empty else 0
             
-            # 1. FILA DE MÉTRICAS (KPIs)
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                st.metric("Balance Actual", f"${current_balance:,.2f}", delta=f"${net_pnl:,.2f} Total")
-                st.caption(f"Balance Inicial: ${STARTING_BALANCE:,.0f}")
+            # --- SECCIÓN 1: METAS Y PROGRESO ---
+            st.markdown("### 🎯 Objetivo de Payout")
+            profit_target = GOAL_BALANCE - STARTING_BALANCE
+            progress = min(1.0, max(0.0, net_pnl / profit_target)) if profit_target > 0 else 0
             
-            with c2:
-                fig_tw = go.Figure(go.Indicator(mode="gauge+number", value=trade_win, number={'suffix': "%"},
-                    gauge={'bar': {'color': "#00FF88"}, 'axis': {'range': [0, 100]}},
-                    title={'text': "Win Rate", 'font': {'size': 14}}))
-                fig_tw.update_layout(height=150, margin=dict(l=10, r=10, t=30, b=10), paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"})
-                st.plotly_chart(fig_tw, use_container_width=True)
+            col_g1, col_g2 = st.columns([3, 1])
+            with col_g1:
+                st.progress(progress)
+                st.caption(f"Progreso: ${net_pnl:,.2f} / Meta: ${profit_target:,.2f} (Restante: ${max(0, profit_target - net_pnl):,.2f})")
+            with col_g2:
+                 st.metric("Distancia a Meta", f"{progress*100:.1f}%")
 
-            with c3:
-                dd_color = "#00FF88" if current_dd < (MAX_DRAWDOWN_LIMIT * 0.5) else "#FFCC00" if current_dd < (MAX_DRAWDOWN_LIMIT * 0.8) else "#FF4B4B"
-                st.write("**Uso de Drawdown Máx.**")
-                st.markdown(f"""
-                    <div style="width: 100%; background-color: #444; border-radius: 5px; height: 25px; margin-bottom:5px;">
-                        <div style="width: {dd_pct_of_limit*100}%; background-color: {dd_color}; height: 100%; border-radius: 5px;"></div>
-                    </div>
-                """, unsafe_allow_html=True)
-                st.caption(f"DD Actual: ${current_dd:,.2f} / Límite: ${MAX_DRAWDOWN_LIMIT:,.0f}")
+            # --- SECCIÓN 2: KPIs PRINCIPALES ---
+            st.markdown("---")
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
             
-            with c4:
-                avg_w = df[df['P&L'] > 0]['P&L'].mean() if not df[df['P&L'] > 0].empty else 0
-                avg_l = abs(df[df['P&L'] < 0]['P&L'].mean()) if not df[df['P&L'] < 0].empty else 1
-                ratio = avg_w / (avg_w + avg_l) if (avg_w + avg_l) > 0 else 0.5
-                st.write("**Avg Win vs Loss**")
-                st.markdown(f"""
-                    <div style="width: 100%; background-color: #444; border-radius: 5px; height: 15px; display: flex;">
-                        <div style="width: {ratio*100}%; background-color: #00FF88; height: 100%; border-radius: 5px 0 0 5px;"></div>
-                        <div style="width: {(1-ratio)*100}%; background-color: #FF4B4B; height: 100%; border-radius: 0 5px 5px 0;"></div>
-                    </div>
-                """, unsafe_allow_html=True)
-                st.caption(f"W: ${avg_w:,.0f} / L: ${avg_l:,.0f}")
+            with kpi1:
+                st.metric("Balance Total", f"${current_balance:,.2f}", delta=f"${net_pnl:,.2f}")
+            with kpi2:
+                st.metric("Win Rate", f"{win_rate:.1f}%", delta="Objetivo: 60%")
+            with kpi3:
+                st.metric("Profit Factor", f"{profit_factor:.2f}", delta="Objetivo: >1.5")
+            with kpi4:
+                dd_color = "normal" if current_dd < 1500 else "inverse"
+                st.metric("Drawdown Actual", f"-${current_dd:,.2f}", delta=f"Límite: ${MAX_DRAWDOWN_LIMIT}", delta_color=dd_color)
 
-            # 2. MILESTONE SECTION
-            st.divider()
-            target_val = 54100
-            target_profit_needed = target_val - STARTING_BALANCE
-            progress_pct = min(1.0, max(0.0, net_pnl / target_profit_needed)) if net_pnl > 0 else 0
+            # --- SECCIÓN 3: GRÁFICOS ---
+            col_chart1, col_chart2 = st.columns([2, 1])
             
-            col_target1, col_target2 = st.columns([2, 1])
-            with col_target1:
-                st.subheader(f"🎯 Milestone a Objetivo: ${target_val:,.0f}")
-                st.progress(progress_pct)
-                st.write(f"Progreso Profit: **{progress_pct*100:.2f}%** | Faltan: **${max(0, target_val - current_balance):,.2f}**")
-            
-            with col_target2:
-                trades_to_goal = int((target_val - current_balance) / avg_w) if avg_w > 0 and (target_val > current_balance) else 0
-                st.metric("Trades Est. para Meta", f"~{trades_to_goal}", help="Basado en tu promedio de ganancia.")
-
-            # 3. GRÁFICOS INTERMEDIOS
-            col_radar, col_pnl_chart = st.columns([1, 1])
-            with col_radar:
-                st.subheader("🎯 Zella Score")
-                categories = ['Win %', 'Profit Factor', 'Risk Reward', 'DD Control', 'Consistency']
-                dd_score = max(0, 100 - (dd_pct_of_limit * 100))
-                scores = [trade_win, min(100, pf*20), (avg_w/avg_l)*20, dd_score, 75] 
-                fig_radar = go.Figure(data=go.Scatterpolar(r=scores, theta=categories, fill='toself', line_color='#00FF88'))
-                fig_radar.update_layout(polar=dict(radialaxis=dict(visible=False)), template="plotly_dark", height=350)
-                st.plotly_chart(fig_radar, use_container_width=True)
-
-            with col_pnl_chart:
+            with col_chart1:
                 st.subheader("📈 Curva de Equidad")
-                # Punto de inicio para el gráfico
-                initial_point = pd.DataFrame({'Date': [df['Date'].min()], 'Equity': [STARTING_BALANCE]})
-                plot_df = pd.concat([initial_point, df[['Date', 'Equity']]]).sort_values('Date')
-                
-                fig_equity = go.Figure(go.Scatter(x=plot_df['Date'], y=plot_df['Equity'], fill='tozeroy', line_color='#00FF88', name="Equity"))
-                fig_equity.add_hline(y=LIQUIDATION_THRESHOLD, line_dash="dash", line_color="red", annotation_text="Límite Drawdown")
-                fig_equity.update_layout(template="plotly_dark", height=350, margin=dict(l=0,r=0,b=0,t=20))
+                fig_equity = go.Figure()
+                fig_equity.add_trace(go.Scatter(x=df['Date'], y=df['Equity'], mode='lines', name='Equity', fill='tozeroy', line=dict(color='#00FF88', width=2)))
+                fig_equity.add_hline(y=LIQUIDATION_THRESHOLD, line_dash="dash", line_color="#FF4B4B", annotation_text="Liquidation Lvl")
+                fig_equity.add_hline(y=GOAL_BALANCE, line_dash="dash", line_color="#00CCFF", annotation_text="Payout Goal")
+                fig_equity.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", height=350, margin=dict(l=0,r=0,t=30,b=0))
                 st.plotly_chart(fig_equity, use_container_width=True)
 
-            # 4. CALENDARIO
-            st.divider()
-            st.subheader("📅 Calendario Mensual")
-            daily_map = df.groupby(df['Date'].dt.date)['P&L'].sum().to_dict()
-            cal = calendar.monthcalendar(datetime.now().year, datetime.now().month)
-            for week in cal:
-                cols = st.columns(7)
-                for i, day in enumerate(week):
-                    if day != 0:
-                        d_obj = date(datetime.now().year, datetime.now().month, day)
-                        val = daily_map.get(d_obj, 0)
-                        color = "#00FF88" if val > 0 else "#FF4B4B" if val < 0 else "#444"
-                        cols[i].markdown(f"<div style='border:1px solid #333; padding:5px; text-align:center; border-radius:5px;'>{day}<br><b style='color:{color}'>${val:,.0f}</b></div>", unsafe_allow_html=True)
+            with col_chart2:
+                st.subheader("📊 Zella Score")
+                # Cálculo simple de un "Score" de trader
+                score_consistency = 100 if len(df) > 10 else len(df)*10
+                score_profit = min(100, profit_factor * 30)
+                score_risk = max(0, 100 - (dd_pct_of_limit * 100))
+                
+                categories = ['Win Rate', 'Profit Factor', 'Risk Mgmt', 'Consistency', 'Momentum']
+                values = [win_rate, score_profit, score_risk, score_consistency, 80]
+                
+                fig_radar = go.Figure(data=go.Scatterpolar(r=values, theta=categories, fill='toself', line_color='#00CCFF'))
+                fig_radar.update_layout(polar=dict(radialaxis=dict(visible=False, range=[0, 100])), template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", height=350, margin=dict(l=40,r=40,t=30,b=30))
+                st.plotly_chart(fig_radar, use_container_width=True)
 
-            # 5. REGISTRO DETALLADO
-            st.divider()
-            st.subheader("📜 Bitácora Histórica")
-            df_log = df.sort_values(by='Date', ascending=False).copy()
+            # --- SECCIÓN 4: HISTORIAL ---
+            st.markdown("---")
+            st.subheader("📜 Historial de Operaciones")
+            
+            # Formato condicional para el dataframe
             def color_pnl(val):
                 color = '#00FF88' if val > 0 else '#FF4B4B' if val < 0 else 'white'
-                return f'color: {color}; font-weight: bold'
+                return f'color: {color}'
 
+            display_df = df[['Date', 'Symbol', 'Side', 'Setup', 'P&L', 'R_Multiple', 'Mistakes']].sort_values('Date', ascending=False)
             st.dataframe(
-                df_log[['Date', 'Symbol', 'Side', 'P&L', 'R_Multiple', 'Setup']].style.applymap(color_pnl, subset=['P&L'])
-                .format({"P&L": "${:,.2f}", "R_Multiple": "{:.2f}R"}),
-                use_container_width=True, hide_index=True
+                display_df.style.map(color_pnl, subset=['P&L']).format({"P&L": "${:,.2f}", "Date": "{:%Y-%m-%d}"}),
+                use_container_width=True,
+                hide_index=True
             )
             
         else:
-            st.info("No hay datos suficientes. Registra tu primer trade para activar la terminal.")
+            st.info("👋 ¡Bienvenido! Aún no tienes trades registrados. Ve al menú lateral para ingresar tu primera operación.")
