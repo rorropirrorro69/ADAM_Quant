@@ -1,4 +1,7 @@
 streamlit
+
 pandas
+
+st-gsheets-connection
+
 plotly
-supabase
